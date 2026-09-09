@@ -24,9 +24,9 @@ set -eu
 # - 05_calc_visibility_for_exposures.py  # compute visibility & merge into out*.csv
 #
 # Environment knobs: ETC_CLI, SERVER, PYTHON, CATALOGUE, EXPTIME,
-# MAKE_JOBS, FORCE_MAKE and visibility-specific vars (TEL_OVERHEAD,
-# INSTR_OVERHEAD, ACQ_OVERHEAD, READOUT_PER_SPEC, N_SPEC, VISITS_PER_YEAR,
-# EXPOSURES_PER_VISIT, VIS_YEAR, VIS_STEP, VIS_SITE).
+# MAKE_JOBS, FORCE_MAKE, SKIP_EXISTING_OUT and visibility-specific vars
+# (TEL_OVERHEAD, INSTR_OVERHEAD, ACQ_OVERHEAD, READOUT_PER_SPEC, N_SPEC,
+# VISITS_PER_YEAR, EXPOSURES_PER_VISIT, VIS_YEAR, VIS_STEP, VIS_SITE).
 
 ETC_CLI="${ETC_CLI:-03_etc_cli.py}"
 SERVER="${SERVER:-https://etc.eso.org}"
@@ -35,6 +35,7 @@ CATALOGUE="${CATALOGUE:-reiners_basri_2008_joined.csv}"
 MAKE_JOBS="${MAKE_JOBS:-1}"
 FORCE_MAKE="${FORCE_MAKE:-0}"
 EXPTIME="${EXPTIME:-3600}"
+SKIP_EXISTING_OUT="${SKIP_EXISTING_OUT:-0}"
 FLUXED_CATALOGUE="${FLUXED_CATALOGUE:-${CATALOGUE%.csv}_with_fluxes.csv}"
 
 # Visibility check parameters (can be overridden in env)
@@ -49,6 +50,21 @@ VIS_YEAR="${VIS_YEAR:-2027}"
 VIS_STEP="${VIS_STEP:-30}"
 
 VIS_SITE="${VIS_SITE:-vlt}"
+
+# True if $1 is an existing, non-empty ETC output with real spectra (not a
+# truncated download or an error response), so it is safe to reuse instead of
+# calling the ETC again. Set SKIP_EXISTING_OUT=1 to enable this reuse.
+is_valid_etc_output() {
+    [ -s "$1" ] && "$PYTHON" -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+sp = d.get("data", {}).get("plots", {}).get("spectra")
+sys.exit(0 if isinstance(sp, list) and sp else 1)
+' "$1" 2>/dev/null
+}
 
 if [ ! -f "$ETC_CLI" ] && ! command -v "$ETC_CLI" >/dev/null 2>&1; then
     echo "03_etc_cli.py not found at '$ETC_CLI'." >&2
@@ -107,11 +123,20 @@ for dir in "${MODE_DIRS[@]}"; do
     fi
 
     echo "Running ${#jsons[@]} ETC jobs in $dir"
+    n_skipped=0
     for json in "${jsons[@]}"; do
         out="${json%.json}.out.json"
+        if [ "$SKIP_EXISTING_OUT" -ne 0 ] && is_valid_etc_output "$out"; then
+            n_skipped=$((n_skipped + 1))
+            continue
+        fi
         echo "  -> $json"
         "$PYTHON" "$ETC_CLI" uves "$json" -s "$SERVER" -o "$out"
     done
+    if [ "$n_skipped" -gt 0 ]; then
+        echo "  skipped $n_skipped job(s) with an existing valid .out.json " \
+             "(SKIP_EXISTING_OUT=1)"
+    fi
     echo
     echo "Finished $dir -> outputs written beside the input JSON files"
     echo "(each input produced its matching .out.json file)"
