@@ -26,7 +26,6 @@ import os
 import sys
 
 import pandas as pd
-import numpy as np
 
 from visibility_astroplan import annual_observability, build_constraints, SITES, DEFAULT_SITE
 from astropy.coordinates import SkyCoord
@@ -50,8 +49,6 @@ def compute_for_catalogue(catfile: str, outcsv: str, site: str,
 
     # build observer and constraints
     site_key = site.lower()
-    if site_key == 'paranal':
-        site_key = 'vlt'
     if site_key not in SITES:
         raise SystemExit(f"unknown site '{site}'; choices: {sorted(SITES)}")
     s = SITES[site_key]
@@ -61,22 +58,15 @@ def compute_for_catalogue(catfile: str, outcsv: str, site: str,
     observer = Observer(location=loc, name=s['name'])
     constraints = build_constraints(s.get('airmass_limit', 2.0), twilight, moon_sep, moon_illum)
 
-    # assemble FixedTarget list: prefer ra_deg/dec_deg, otherwise parse 2MASS
+    # assemble FixedTarget list from the ra_deg/dec_deg columns written by
+    # collect_etc_snr (the 2MASS designation is resolved to coordinates
+    # exactly once, upstream of this script; nothing here re-derives them).
+    if 'ra_deg' not in cat.columns or 'dec_deg' not in cat.columns:
+        raise SystemExit(
+            f"'{catfile}' has no ra_deg/dec_deg columns; run collect_etc_snr "
+            f"first so coordinates are resolved before visibility is computed")
     names = list(cat['name']) if 'name' in cat.columns else list(cat.get('designation', []))
-    coords = []
-    if 'ra_deg' in cat.columns and 'dec_deg' in cat.columns:
-        coords = [SkyCoord(r * u.deg, d * u.deg) for r, d in zip(cat['ra_deg'], cat['dec_deg'])]
-    else:
-        from visibility_astroplan import twomass_to_radec
-        desig = list(cat.get('designation', []))
-        coords = []
-        for d in desig:
-            ra, dec = twomass_to_radec(d)
-            if not (isinstance(ra, float) and np.isfinite(ra)):
-                coords.append(SkyCoord(0, 0, unit=(u.deg, u.deg)))
-            else:
-                coords.append(SkyCoord(ra * u.deg, dec * u.deg))
-
+    coords = [SkyCoord(r * u.deg, d * u.deg) for r, d in zip(cat['ra_deg'], cat['dec_deg'])]
     targets = [FixedTarget(coord=c, name=n) for c, n in zip(coords, names)]
 
     # compute annual observability (this returns arrays aligned with targets)

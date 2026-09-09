@@ -132,6 +132,20 @@ def safe_name(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", str(text)).strip("_")
 
 
+def parse_2mass_radec(designation: str) -> tuple[float, float]:
+    """RA, Dec in degrees from a 2MASS designation, or NaN on a bad string."""
+    s = re.sub(r"\s+", "", str(designation)).upper()
+    s = re.sub(r"^2MASS", "", s)
+    s = re.sub(r"^J", "", s)
+    m = re.match(r"^(\d{2})(\d{2})(\d{2})(\d{2})([+-])(\d{2})(\d{2})(\d{2})(\d?)", s)
+    if not m:
+        return float("nan"), float("nan")
+    hh, mm, ss, ff, sign, dd, dm, ds, df = m.groups()
+    ra = (int(hh) + int(mm) / 60 + (int(ss) + int(ff) / 100) / 3600) * 15.0
+    dec = int(dd) + int(dm) / 60 + (int(ds) + int(df or 0) / 10) / 3600
+    return ra, (-dec if sign == "-" else dec)
+
+
 def build_name_resolver(files, manifests, catalogue_names):
     """Work out which target each ETC output belongs to.
 
@@ -598,6 +612,14 @@ def main(argv=None):
     cat = None
     if args.catalogue:
         cat = pd.read_csv(args.catalogue)
+        # make_etc_jobs resolves and caches ra_deg/dec_deg into the catalogue
+        # it runs against; only fall back to parsing the designation here if
+        # that hasn't happened (e.g. a catalogue used outside the pipeline).
+        if "designation" in cat.columns and (
+                "ra_deg" not in cat.columns or "dec_deg" not in cat.columns):
+            radec = [parse_2mass_radec(d) for d in cat["designation"]]
+            cat["ra_deg"] = [r for r, _ in radec]
+            cat["dec_deg"] = [d for _, d in radec]
         if "name" in cat.columns and args.ew_column in cat.columns:
             lim = (cat["ew_is_limit"] if "ew_is_limit" in cat.columns
                    else pd.Series(False, index=cat.index))

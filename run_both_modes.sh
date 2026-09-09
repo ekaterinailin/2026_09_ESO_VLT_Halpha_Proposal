@@ -15,7 +15,10 @@ set -eu
 #
 # Python scripts (execution order):
 # - 01_halpha_flux.py            # compute Halpha flux columns for the catalogue
-# - 02_make_etc_jobs.py          # generate per-target ETC JSONs (run for 1x2 and 2x2)
+# - 02_make_etc_jobs.py          # generate per-target ETC JSONs (run for 1x2 and 2x2);
+#                                 # also resolves ra_deg/dec_deg from the 2MASS
+#                                 # designation once and caches them into
+#                                 # FLUXED_CATALOGUE for every later step to reuse
 # - 03_etc_cli.py (ETC_CLI)      # run the ETC on each JSON, producing .out.json
 # - 04_collect_etc_snr.py        # collect per-target SNR and merge into out*.csv
 # - 05_calc_visibility_for_exposures.py  # compute visibility & merge into out*.csv
@@ -43,9 +46,9 @@ N_SPEC="${N_SPEC:-1}"
 VISITS_PER_YEAR="${VISITS_PER_YEAR:-6}"
 EXPOSURES_PER_VISIT="${EXPOSURES_PER_VISIT:-3}"
 VIS_YEAR="${VIS_YEAR:-2027}"
-VIS_STEP="${VIS_STEP:-10}"
+VIS_STEP="${VIS_STEP:-30}"
 
-VIS_SITE="${VIS_SITE:-paranal}"
+VIS_SITE="${VIS_SITE:-vlt}"
 
 if [ ! -f "$ETC_CLI" ] && ! command -v "$ETC_CLI" >/dev/null 2>&1; then
     echo "03_etc_cli.py not found at '$ETC_CLI'." >&2
@@ -113,8 +116,9 @@ for dir in "${MODE_DIRS[@]}"; do
     echo "Finished $dir -> outputs written beside the input JSON files"
     echo "(each input produced its matching .out.json file)"
     echo
-        # Collect SNR/results for this mode into a summary CSV. Default catalogue
-        # can be overridden with the CATALOGUE env var.
+        # Collect SNR/results for this mode into a summary CSV. Uses the fluxed
+        # catalogue, since make_etc_jobs has already resolved and cached
+        # ra_deg/dec_deg into it (see FLUXED_CATALOGUE / CATALOGUE env vars).
         base=$(basename "$dir")
         if [ "$base" = "etc_jobs_2x2" ] || printf '%s' "$base" | grep -q "2x2"; then
             outcsv="out2x2.csv"
@@ -122,7 +126,7 @@ for dir in "${MODE_DIRS[@]}"; do
             outcsv="out.csv"
         fi
         echo "Collecting SNR results for $dir -> $outcsv"
-        "$PYTHON" 04_collect_etc_snr.py "$dir" --catalogue "$CATALOGUE" --output "$outcsv"
+        "$PYTHON" 04_collect_etc_snr.py "$dir" --catalogue "$FLUXED_CATALOGUE" --output "$outcsv"
         echo
         # Update by-time table with visibility scheduling info
         if [ -f 05_calc_visibility_for_exposures.py ]; then

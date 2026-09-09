@@ -16,7 +16,9 @@ What gets patched, and nothing else
     target.sed.emissionline.params.fwhm     <- fwhm_nm from the catalogue
     target.brightness.flux                  <- F_line in W/m^2
     sky.airmass                             <- per target, or a fixed value
-    sky.almanac.targetName / ra / dec       <- parsed from the 2MASS designation
+    sky.almanac.targetName / ra / dec       <- ra_deg/dec_deg from the catalogue,
+                                                resolved from the 2MASS designation
+                                                once and cached back into the CSV
     timesnr.DET2.WIN1.UIT1                  <- exposure time in seconds
     timesnr.SEQ.NEXPO                       <- number of exposures
 
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import importlib.util
 import json
 import math
 import os
@@ -55,7 +58,7 @@ FLUX_WM2_RANGE = (1e-24, 1e-12)
 
 # ---------------------------------------------------------------------------
 def parse_2mass(designation: str):
-    """RA and Dec in degrees from a 2MASS designation.
+    """RA and Dec in degrees from a 2MASS designation, or NaN if unparseable.
 
     '2MASS J03140344+1603056' -> (48.51433, 16.05156)
 
@@ -66,13 +69,27 @@ def parse_2mass(designation: str):
     m = re.search(r"J?(\d{2})(\d{2})(\d{2})(\d{2})([+-])(\d{2})(\d{2})(\d{2})(\d?)",
                   str(designation).replace(" ", ""))
     if not m:
-        raise ValueError(f"cannot parse coordinates from {designation!r}")
+        return float("nan"), float("nan")
     hh, mm, ss, ff, sign, dd, dm, ds, df = m.groups()
     ra = (int(hh) + int(mm) / 60 + (int(ss) + int(ff) / 100) / 3600) * 15.0
     dec = int(dd) + int(dm) / 60 + (int(ds) + int(df or 0) / 10) / 3600
     if sign == "-":
         dec = -dec
     return ra, dec
+
+
+def resolve_radec(cat: pd.DataFrame) -> pd.DataFrame:
+    """Add ra_deg/dec_deg to `cat` from its 2MASS designation, if not already
+    present. Called once, before any per-exposure-time job generation, so the
+    2MASS string is only ever parsed a single time per target."""
+    if "ra_deg" in cat.columns and "dec_deg" in cat.columns:
+        return cat
+    desig = cat["designation"] if "designation" in cat.columns else cat.get(
+        "name", pd.Series([""] * len(cat)))
+    radec = [parse_2mass(d) for d in desig]
+    cat["ra_deg"] = [r for r, _ in radec]
+    cat["dec_deg"] = [d for _, d in radec]
+    return cat
 
 
 def airmass_at_transit(dec_deg: float, lat_deg: float = PARANAL_LAT) -> float:
@@ -188,6 +205,22 @@ def continuum_to_line_ratio(row, fwhm_nm: float) -> float:
     return 1.5056 * (fwhm_nm * 10.0) / ew
 
 
+def _import_halpha_flux():
+    """Load 01_halpha_flux.py by path.
+
+    Its filename isn't a valid Python identifier (leading digit), so a plain
+    `import halpha_flux` can't find it; load it by file path instead.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "01_halpha_flux.py")
+    if not os.path.isfile(path):
+        return None
+    spec = importlib.util.spec_from_file_location("halpha_flux_01", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def verify_catalogue_units(cat: pd.DataFrame, flux_col: str) -> None:
     """Cross-check the catalogue's units against its own redundant columns.
 
@@ -210,10 +243,10 @@ def verify_catalogue_units(cat: pd.DataFrame, flux_col: str) -> None:
                 f"(worst: {worst.get('name')})")
 
     # 2. Recompute the flux from spt, J and the activity measure.
-    try:
-        from halpha_flux import halpha_line_flux
-    except ImportError:
+    hf = _import_halpha_flux()
+    if hf is None:
         return
+    halpha_line_flux = hf.halpha_line_flux
     have = {"spt", "J"} <= set(cat.columns)
     src = "log_lha_lbol" if flux_col.endswith("ratio_W_m2") else "ew_ha"
     if have and src in cat.columns:
@@ -269,14 +302,10 @@ def build_jobs(cat: pd.DataFrame, template: dict, outdir: str,
         if not (np.isfinite(flux) and np.isfinite(fwhm)):
             skip = "flux or FWHM not calculated"
 
-        ra = dec = np.nan
-        am_min = np.nan
         desig = r.get("designation", name)
-        try:
-            ra, dec = parse_2mass(desig)
-            am_min = airmass_at_transit(dec)
-        except ValueError:
-            pass
+        ra = r.get("ra_deg", np.nan)
+        dec = r.get("dec_deg", np.nan)
+        am_min = airmass_at_transit(dec) if np.isfinite(dec) else np.nan
 
         if skip is None and np.isfinite(am_min) and am_min > max_airmass:
             skip = f"never below airmass {max_airmass} from Paranal (min {am_min:.2f})"
@@ -288,7 +317,7 @@ def build_jobs(cat: pd.DataFrame, template: dict, outdir: str,
         else:
             airmass = fixed_airmass
 
-        rec = dict(name=name, designation=desig, ra_deg=ra, dec_deg=dec,
+        rec = dict(name=name, designation=desig,
                    airmass_min=am_min, airmass_used=airmass,
                    flux_W_m2=flux, fwhm_nm=fwhm,
                    cont_over_line=continuum_to_line_ratio(r, fwhm)
@@ -538,6 +567,11 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     cat = pd.read_csv(args.catalogue)
+    if "ra_deg" not in cat.columns or "dec_deg" not in cat.columns:
+        cat = resolve_radec(cat)
+        cat.to_csv(args.catalogue, index=False)
+        print(f"Resolved ra_deg/dec_deg from the 2MASS designation and "
+              f"cached them into {args.catalogue}")
     with open(args.template) as fh:
         template = json.load(fh)
 
