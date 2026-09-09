@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-make_etc_jobs.py
-================
+02_make_etc_jobs.py
+===================
 
 Take the catalogue produced by `add_halpha_flux` and stamp out one ESO
 UVES ETC 2.0 input JSON per target, by patching a template downloaded from
@@ -128,6 +128,14 @@ def patch_template(template: dict, *, flux_wm2: float, fwhm_nm: float,
     job["target"]["brightness"]["flux"] = float(flux_wm2)
 
     job["sky"]["airmass"] = round(float(airmass), 3)
+    # Sanity-check: ensure the template got patched. Warn if it did not.
+    try:
+        patched = float(job["sky"].get("airmass"))
+        if abs(patched - float(airmass)) > 1e-6:
+            print(f"WARNING: requested airmass {airmass} but template has "
+                  f"{patched} after patching", file=sys.stderr)
+    except Exception:
+        print("WARNING: could not verify patched sky.airmass", file=sys.stderr)
     alm = job["sky"].get("almanac")
     if alm is not None:
         alm["targetName"] = str(name)
@@ -260,8 +268,6 @@ def build_jobs(cat: pd.DataFrame, template: dict, outdir: str,
         skip = None
         if not (np.isfinite(flux) and np.isfinite(fwhm)):
             skip = "flux or FWHM not calculated"
-        elif detections_only and "is_detection" in cat.columns and not r["is_detection"]:
-            skip = "upper limit, not a detection"
 
         ra = dec = np.nan
         am_min = np.nan
@@ -510,9 +516,10 @@ def main(argv=None):
     p.add_argument("--exptime", type=float, default=3600.0,
                    help="exposure time per job, seconds")
     p.add_argument("--nexpo", type=int, default=1)
-    p.add_argument("--probe-times", type=str, default=None,
+    p.add_argument("--probe-times", type=str,
+                   default="500,1000,2000,4000,8000",
                    help="comma-separated exposure times; emits one job per "
-                        "target per time, for fitting the S/N curve")
+                        "target per time (default: 500,1000,2000,4000,8000s)")
     p.add_argument("--airmass", choices=["transit", "fixed"], default="transit",
                    help="'transit' uses the minimum airmass reachable from "
                         "Paranal for each declination")
@@ -520,7 +527,7 @@ def main(argv=None):
     p.add_argument("--max-airmass", type=float, default=2.0,
                    help="targets that never get below this are skipped")
     p.add_argument("--all-rows", action="store_true",
-                   help="include upper limits as if they were detections")
+                   help="legacy flag retained for compatibility; upper limits are included by default")
     p.add_argument("--snr", type=float, default=None,
                    help="target S/N to solve NEXPO for; requires a template "
                         "downloaded in SNR-solve mode (with a red_snr field)")
@@ -534,6 +541,17 @@ def main(argv=None):
     with open(args.template) as fh:
         template = json.load(fh)
 
+    # If the template specifies a sky.airmass, inherit it and force fixed mode
+    t_air = template.get("sky", {}).get("airmass")
+    if t_air is not None:
+        try:
+            t_air = float(t_air)
+            args.airmass = "fixed"
+            args.fixed_airmass = float(t_air)
+            print(f"Inheriting template sky.airmass = {t_air} for all jobs")
+        except Exception:
+            raise SystemExit("template sky.airmass is not numeric")
+
     times = ([float(t) for t in args.probe_times.split(",")]
              if args.probe_times else [args.exptime])
 
@@ -543,13 +561,13 @@ def main(argv=None):
             else args.outdir
         m = build_jobs(cat, template, sub, args.track, t, args.nexpo,
                        args.airmass, args.fixed_airmass, args.max_airmass,
-                       not args.all_rows, args.snr, args.snr_window_fwhm)
+                       False, args.snr, args.snr_window_fwhm)
         m["exptime_s"] = t
         manifests.append(m)
     manifest = pd.concat(manifests, ignore_index=True)
 
     os.makedirs(args.outdir, exist_ok=True)
-    mpath = os.path.join(args.outdir, "manifest.csv")
+    mpath = os.path.join(args.outdir, "json_to_target_dict.csv")
     manifest.to_csv(mpath, index=False)
     driver = write_driver(manifest, args.outdir, args.etc_cli)
 
@@ -574,8 +592,8 @@ def main(argv=None):
         print("  NOTE: this template has no sky.almanac block, so the ETC "
               "output will not carry")
         print("        a targetName. Pass --manifest "
-              f"{os.path.join(args.outdir, 'manifest.csv')} to "
-              "collect_etc_snr.py,")
+              f"{os.path.join(args.outdir, 'json_to_target_dict.csv')} to "
+              "04_collect_etc_snr.py,")
         print("        or leave the generated filenames alone so targets can "
               "be identified from them.")
     ts = template.get("timesnr", {})

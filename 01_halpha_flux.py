@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-halpha_flux.py
-==============
+01_halpha_flux.py
+=================
 
 Standalone conversion from ultracool-dwarf activity strength to Halpha line
 flux in SI units.  No dependencies beyond the standard library.

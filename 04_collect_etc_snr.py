@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-collect_etc_snr.py
-==================
+04_collect_etc_snr.py
+=====================
 
 Read ESO UVES ETC 2.0 output JSONs, integrate the signal-to-noise over the
 whole emission line, and merge the result into the catalogue as `int_snr`.
@@ -143,7 +143,7 @@ def build_name_resolver(files, manifests, catalogue_names):
          record ends up nameless, and since the merge, the equivalent-width
          lookup and the per-target collapse all key on the name, the whole
          pipeline quietly produces nothing.
-      2. a manifest.csv written by make_etc_jobs, matched on the job path.
+      2. a json_to_target_dict.csv written by make_etc_jobs, matched on the job path.
       3. the output filename stem, matched against the catalogue names after
          normalising punctuation the same way make_etc_jobs does.
 
@@ -216,6 +216,70 @@ def _order_arrays(spec: dict):
     terms = nc["noise_terms"]
     const_var = float(terms["dark_term"]) + float(terms["ron_term"])
     return w, t, s, n, const_var, nc["noise_info"]
+
+
+def average_snr_per_pixel_in_band(path: str, lo_nm: float, hi_nm: float) -> dict:
+    """Mean and RMS per-pixel S/N in a wavelength window, using the same ETC arrays.
+
+    This is the direct analogue of the FeH-band measurement in Reiners & Basri,
+    where the reported quantity is the average S/N per pixel over a chosen band.
+    """
+    with open(path) as fh:
+        doc = json.load(fh)
+
+    spectra = doc["data"]["plots"]["spectra"]
+    total_pix = 0
+    total_mean = 0.0
+    total_rms2 = 0.0
+    total_signal = 0.0
+    total_noise = 0.0
+    all_snr = []
+    per_order = []
+
+    for sp in spectra:
+        w, t, s, n, cv, info = _order_arrays(sp)
+        mask = (w >= lo_nm) & (w <= hi_nm)
+        if not np.any(mask):
+            continue
+
+        t_band = t[mask]
+        n_band = n[mask]
+        snr = np.divide(t_band, n_band, out=np.zeros_like(t_band), where=n_band > 0)
+        total_pix += int(mask.sum())
+        total_mean += float(snr.sum())
+        total_rms2 += float((snr ** 2).sum())
+        total_signal += float(t_band.sum())
+        total_noise += float(np.sqrt(np.sum(n_band ** 2)))
+        all_snr.extend(snr.tolist())
+
+        per_order.append(dict(
+            order=sp.get("order"), detector=sp.get("detector_name"),
+            npix=int(mask.sum()),
+            mean_snr_per_pixel=float(np.mean(snr)) if snr.size else 0.0,
+            rms_snr_per_pixel=float(np.sqrt(np.mean(snr ** 2))) if snr.size else 0.0,
+            signal_e=float(t_band.sum()), noise_e=float(np.sqrt(np.sum(n_band ** 2))),
+            lo_nm=float(lo_nm), hi_nm=float(hi_nm),
+        ))
+
+    if total_pix == 0:
+        raise ValueError(f"{path}: no pixels fall in {lo_nm}..{hi_nm} nm")
+
+    snr_arr = np.asarray(all_snr, dtype=float)
+    p16 = float(np.percentile(snr_arr, 16)) if snr_arr.size else 0.0
+    p84 = float(np.percentile(snr_arr, 84)) if snr_arr.size else 0.0
+
+    return dict(
+        file=os.path.basename(path),
+        lo_nm=float(lo_nm), hi_nm=float(hi_nm),
+        n_pix=total_pix,
+        mean_snr_per_pixel=total_mean / total_pix,
+        rms_snr_per_pixel=math.sqrt(total_rms2 / total_pix),
+        p16_snr_per_pixel=p16,
+        p84_snr_per_pixel=p84,
+        mean_signal_e=total_signal / total_pix,
+        mean_noise_e=total_noise / total_pix,
+        per_order=per_order,
+    )
 
 
 def integrate_line(path: str, n_sigma: float = 4.0,
@@ -500,7 +564,7 @@ def main(argv=None):
                    help="catalogue column holding the Halpha equivalent width "
                         "in Angstrom; drives the continuum correction")
     p.add_argument("--manifest", default=None,
-                   help="manifest.csv from make_etc_jobs, used to identify "
+                   help="json_to_target_dict.csv from make_etc_jobs, used to identify "
                         "targets when the ETC output carries no targetName")
     p.add_argument("--reference", choices=["longest", "shortest"],
                    default="longest",
@@ -560,12 +624,12 @@ def main(argv=None):
                if inputs else ""))
 
     # Names may not be inside the outputs at all, so build a fallback map.
-    manifests = sorted({os.path.join(d, "manifest.csv")
+    manifests = sorted({os.path.join(d, "json_to_target_dict.csv")
                         for d in {os.path.dirname(os.path.abspath(f))
                                   for f, _ in outputs}
                         | {os.path.dirname(os.path.dirname(os.path.abspath(f)))
                            for f, _ in outputs}
-                        if os.path.isfile(os.path.join(d, "manifest.csv"))})
+                        if os.path.isfile(os.path.join(d, "json_to_target_dict.csv"))})
     if args.manifest:
         manifests = [args.manifest] + manifests
     resolver = build_name_resolver(
@@ -646,7 +710,7 @@ def main(argv=None):
             f"target.\n"
             f"  The ETC output carries no sky.almanac.targetName, which happens "
             f"when the form was downloaded without an almanac block.\n"
-            f"  Point --manifest at the manifest.csv written by "
+            f"  Point --manifest at the json_to_target_dict.csv written by "
             f"make_etc_jobs, or keep the job filenames as generated so they "
             f"can be matched to catalogue names.")
 
@@ -676,10 +740,13 @@ def main(argv=None):
     inst = math.hypot(r0["fwhm_req_nm"], 0.0)
     delivered = r0["fwhm_out_nm"]
     implied_inst = math.sqrt(max(delivered ** 2 - r0["fwhm_req_nm"] ** 2, 0))
+    if implied_inst > 0:
+        r_val = f"{r0['line_centre_nm'] / implied_inst:,.0f}"
+    else:
+        r_val = "N/A"
     print(f"    FWHM in / out             : {r0['fwhm_req_nm'] * 1000:.2f} pm -> "
           f"{delivered * 1000:.2f} pm, implying an LSF of "
-          f"{implied_inst * 1000:.2f} pm (R = "
-          f"{r0['line_centre_nm'] / implied_inst:,.0f})")
+          f"{implied_inst * 1000:.2f} pm (R = {r_val})")
     print(f"    dispersion                : "
           f"{r0['dispersion_nm_pix'] * 10:.5f} A/pixel")
     print(f"    line flux captured        : {r0['flux_fraction'] * 100:.3f} % "
