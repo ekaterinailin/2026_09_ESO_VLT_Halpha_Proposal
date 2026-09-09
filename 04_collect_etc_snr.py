@@ -297,8 +297,7 @@ def average_snr_per_pixel_in_band(path: str, lo_nm: float, hi_nm: float) -> dict
 
 
 def integrate_line(path: str, n_sigma: float = 4.0,
-                   ew_angstrom: float | None = None,
-                   cont_window_A: float = 0.0) -> dict:
+                   ew_angstrom: float | None = None) -> dict:
     """Integrate the S/N over the emission line in one ETC output file."""
     with open(path) as fh:
         doc = json.load(fh)
@@ -358,13 +357,6 @@ def integrate_line(path: str, n_sigma: float = 4.0,
             c_pix = total_flux_all * disp_A / ew_angstrom
             cont_pix = c_pix
             var_cc = t[m] + c_pix + s[m] + cv
-            if cont_window_A > 0:
-                # Penalty for having to estimate the continuum level from a
-                # finite window, on top of its photon noise.
-                fwhm_pix = 2.3548 * sigma / float(np.median(np.diff(w)))
-                n_eff = 1.5056 * fwhm_pix
-                m_cont = cont_window_A / disp_A
-                var_cc = var_cc * (1.0 + n_eff / m_cont)
             sum_snr2_cc += float(((t[m] ** 2) / var_cc).sum())
 
         # Boxcar at its own optimum, so the comparison with the matched filter
@@ -515,51 +507,6 @@ def check_extrapolation(recs: list) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def pivot_by_time(res: pd.DataFrame, columns=("int_snr", "int_snr_cc")):
-    """One column per exposure time, so a sweep is visible in the merged file.
-
-    The collapse to one row per target is what stops the catalogue merge from
-    multiplying rows, but on its own it means only the reference run reaches
-    out.csv and the other folders appear to have been ignored.  Pivoting keeps
-    every folder's number, one column each, named int_snr_t500s and so on.
-    """
-    if res["exptime_s"].nunique() < 2:
-        return None
-    out = None
-    for col in columns:
-        if col not in res.columns or res[col].isna().all():
-            continue
-        w = res.pivot_table(index="name", columns="exptime_s", values=col,
-                            aggfunc="first")
-        w.columns = [f"{col}_t{int(t)}s" for t in w.columns]
-        out = w if out is None else out.join(w, how="outer")
-    return None if out is None else out.reset_index()
-
-
-def collapse_by_target(res: pd.DataFrame, recs: list, how: str) -> pd.DataFrame:
-    """One row per target, so the catalogue merge cannot multiply rows.
-
-    With --probe-times there are several output files per target.  Merging that
-    long table into the catalogue on `name` would silently duplicate catalogue
-    rows, one per exposure time, which is why the collapse happens first and
-    why uniqueness is asserted afterwards.
-    """
-    if (res["name"].astype(str).str.len() == 0).any():
-        raise SystemExit("cannot collapse: some results have no target name")
-    if res["name"].duplicated().any():
-        idx = (res.groupby("name")["exptime_s"].idxmax() if how == "longest"
-               else res.groupby("name")["exptime_s"].idxmin())
-        out = res.loc[sorted(idx)].copy()
-        counts = res.groupby("name").size().rename("n_probe_times")
-        out = out.merge(counts, on="name", how="left")
-    else:
-        out = res.copy()
-        out["n_probe_times"] = 1
-    if out["name"].duplicated().any():
-        raise SystemExit("internal error: names still duplicated after collapse")
-    return out
-
-
 def main(argv=None):
     p = argparse.ArgumentParser(
         description="Integrate ETC line S/N and merge into the catalogue.",
@@ -568,7 +515,8 @@ def main(argv=None):
                    help="ETC output JSON files or directories containing them")
     p.add_argument("--catalogue", default=None,
                    help="CSV to merge into; the int_snr column is added to it")
-    p.add_argument("--output", default="out.csv")
+    p.add_argument("--output", default="out.csv",
+                   help="one row per ETC run (target x exposure time)")
     p.add_argument("--n-sigma", type=float, default=4.0,
                    help="half-width of the integration window, in line sigmas")
     p.add_argument("--target-snr", type=float, default=5.0)
@@ -580,19 +528,6 @@ def main(argv=None):
     p.add_argument("--manifest", default=None,
                    help="json_to_target_dict.csv from make_etc_jobs, used to identify "
                         "targets when the ETC output carries no targetName")
-    p.add_argument("--reference", choices=["longest", "shortest"],
-                   default="longest",
-                   help="with --probe-times output, which run supplies the "
-                        "merged columns")
-    p.add_argument("--by-time-output", default=None,
-                   help="write the full one-row-per-file table here "
-                        "(default: <output stem>_bytime.csv when there are "
-                        "multiple exposure times)")
-    p.add_argument("--cont-window", type=float, default=0.0,
-                   help="Angstrom of continuum used to place the level; if >0 "
-                        "the continuum-placement penalty is applied on top of "
-                        "the continuum photon noise. Reiners & Basri used 27 A "
-                        "of footpoints")
     args = p.parse_args(argv)
 
     files = []
@@ -670,8 +605,7 @@ def main(argv=None):
                                        ("", "unresolved"))
             name_sources[src] = name_sources.get(src, 0) + 1
             ew, ew_lim = ew_map.get(nm, (None, False))
-            r = integrate_line(f, n_sigma=args.n_sigma, ew_angstrom=ew,
-                               cont_window_A=args.cont_window)
+            r = integrate_line(f, n_sigma=args.n_sigma, ew_angstrom=ew)
             # integrate_line reads the name out of the document, which is
             # empty when the template had no almanac block; overwrite it with
             # the resolved one.
@@ -816,30 +750,16 @@ def main(argv=None):
             if chk["rel_err"].abs().max() > 0.05:
                 print(f"      WARNING: above 5%, so t_snr5 from a single run "
                       f"should not be trusted")
-        bt = args.by_time_output or (os.path.splitext(args.output)[0]
-                                     + "_bytime.csv")
-        res.drop(columns=[c for c in res.columns if c.startswith("_")]) \
-            .to_csv(bt, index=False)
-        print(f"    full per-file table     : {bt}")
-        wide = pivot_by_time(res)
-        print(f"    merged columns taken from the {args.reference} run "
-              f"-> {res['name'].nunique()} row(s)")
-        if wide is not None:
-            print(f"    every exposure time also kept as columns: "
-                  + ", ".join(c for c in wide.columns if c != "name"))
-
-    # Always collapse, so the output schema is the same whether or not a
-    # probe-times sweep was supplied.
-    wide = pivot_by_time(res)
-    res = collapse_by_target(res, recs, args.reference)
-    if wide is not None:
-        res = res.merge(wide, on="name", how="left")
 
     if res["saturated"].any() or res["nonlinear"].any():
         print(f"\n  WARNING: {int(res['saturated'].sum())} saturated, "
               f"{int(res['nonlinear'].sum())} non-linear")
 
-    # ---- merge -----------------------------------------------------------
+    # ---- write: one row per ETC run (target x exposure time), always -----
+    # No reference run is picked and nothing is collapsed, so every probed
+    # exposure time reaches the output as its own row; a target probed once
+    # (the common case) just produces one row, same as before.
+    res_out = res.drop(columns=[c for c in res.columns if c.startswith("_")])
     if args.catalogue:
         key = "name" if "name" in cat.columns else None
         if key is None:
@@ -850,35 +770,26 @@ def main(argv=None):
                 "exptime_s", "npix",
                 "folder", "flux_fraction", "limiting_noise", "frac_var_line",
                 "frac_var_sky", "frac_var_cont", "frac_var_const", "saturated"]
-        cols += [c for c in ("t_snr5_hr", "t_snr5_cc_hr", "n_probe_times")
-                 if c in res.columns]
-        cols += [c for c in res.columns
-                 if re.match(r"^int_snr(_cc)?_t\d+s$", c)]
-        cols = [c for c in cols if c in res.columns]
-        add = res[cols].rename(columns={
+        cols += [c for c in ("t_snr5_hr", "t_snr5_cc_hr") if c in res_out.columns]
+        cols = [c for c in cols if c in res_out.columns]
+        add = res_out[cols].rename(columns={
             "exptime_s": "etc_exptime_s", "npix": "etc_npix",
             "folder": "etc_folder",
             "flux_fraction": "etc_flux_fraction",
             "limiting_noise": "etc_limiting_noise",
             "saturated": "etc_saturated"})
-        if add["name"].duplicated().any():
-            raise SystemExit("refusing to merge: duplicate target names would "
-                             "multiply catalogue rows")
-        n_before = len(cat)
-        merged = cat.drop(columns=[c for c in add.columns if c != "name"
-                                   and c in cat.columns]).merge(
-            add, on=key, how="left", validate="one_to_one")
-        if len(merged) != n_before:
-            raise SystemExit(f"merge changed the row count, {n_before} -> "
-                             f"{len(merged)}")
+        # A catalogue row can now match several ETC runs (one per probed
+        # exposure time), so this is one-to-many, not one-to-one; a
+        # catalogue row with no ETC result still appears once, with NaNs.
+        merged = cat.merge(add, on=key, how="left", validate="one_to_many")
         merged.to_csv(args.output, index=False)
-        n = merged["int_snr"].notna().sum()
-        print(f"\n  merged into {len(merged)} catalogue rows, "
-              f"{n} with int_snr")
+        n_targets = merged.loc[merged["int_snr"].notna(), "name"].nunique()
+        print(f"\n  merged into {len(merged)} row(s) "
+              f"({merged['name'].nunique()} catalogue target(s), "
+              f"{n_targets} with an int_snr)")
         print(f"  written to {args.output}")
     else:
-        res.drop(columns=[c for c in res.columns if c.startswith("_")]) \
-            .to_csv(args.output, index=False)
+        res_out.to_csv(args.output, index=False)
         print(f"\n  written to {args.output}")
     return 0
 
