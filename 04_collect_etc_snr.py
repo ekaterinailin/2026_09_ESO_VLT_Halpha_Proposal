@@ -437,41 +437,11 @@ def integrate_line(path: str, n_sigma: float = 4.0,
 
 
 # ---------------------------------------------------------------------------
-def time_for_snr(rec: dict, target_snr: float = 5.0,
-                 max_dit: float = 3600.0, with_continuum: bool = False) -> float:
-    """Exposure time reaching target_snr, from the rates in one ETC run.
-
-    Signal and sky scale with time; the read-noise variance scales with the
-    number of exposures.  Solved numerically because the per-pixel terms do not
-    combine into a single closed form once the profile is weighted.
-    """
-    from scipy.optimize import brentq
-
-    def snr_at(t):
-        n_exp = max(1, math.ceil(t / max_dit))
-        total = 0.0
-        for o in rec["_orders"]:
-            sig = o["target_rate"] * t
-            var = sig + o["sky_rate"] * t + o["const_var_per_exp"] * n_exp
-            if with_continuum:
-                var = var + o["cont_rate"] * t
-            total += float(((sig ** 2) / var).sum())
-        return math.sqrt(total)
-
-    lo, hi = 1.0, 1e7
-    if snr_at(hi) < target_snr:
-        return float("inf")
-    if snr_at(lo) > target_snr:
-        return lo
-    return brentq(lambda t: snr_at(t) - target_snr, lo, hi, xtol=1.0)
-
-
-# ---------------------------------------------------------------------------
 def predict_snr(rec: dict, t: float, n_exp: int = 1) -> float:
     """Integrated S/N at exposure time t, extrapolated from one run's rates.
 
     Signal and sky scale with time; the read-noise and dark variance scale with
-    the number of exposures.  This is the same model `time_for_snr` inverts.
+    the number of exposures.
     """
     total = 0.0
     for o in rec["_orders"]:
@@ -482,13 +452,13 @@ def predict_snr(rec: dict, t: float, n_exp: int = 1) -> float:
 
 
 def check_extrapolation(recs: list) -> pd.DataFrame:
-    """Cross-check the time extrapolation against the probe-times sweep.
+    """Cross-check predict_snr's linear rate model against the probe-times sweep.
 
-    A single ETC run already contains everything needed to predict any other
-    exposure time, because the output separates target, sky and read-noise
-    terms.  A --probe-times sweep is therefore not needed to solve for an
-    exposure time; what it is good for is testing that assumption.  Each
-    target's shortest run is used to predict the others.
+    A single ETC run separates target, sky and read-noise into per-pixel
+    rates, from which predict_snr extrapolates the S/N at any other exposure
+    time. A --probe-times sweep gives an independent way to check that this
+    linear-scaling assumption actually holds: each target's shortest run is
+    used to predict the others, and predicted vs measured is compared.
     """
     rows = []
     by_name = {}
@@ -519,9 +489,6 @@ def main(argv=None):
                    help="one row per ETC run (target x exposure time)")
     p.add_argument("--n-sigma", type=float, default=4.0,
                    help="half-width of the integration window, in line sigmas")
-    p.add_argument("--target-snr", type=float, default=5.0)
-    p.add_argument("--max-dit", type=float, default=3600.0)
-    p.add_argument("--no-time-solve", action="store_true")
     p.add_argument("--ew-column", default="ew_ha",
                    help="catalogue column holding the Halpha equivalent width "
                         "in Angstrom; drives the continuum correction")
@@ -621,13 +588,6 @@ def main(argv=None):
         except (KeyError, ValueError) as exc:
             failed.append((os.path.basename(f), str(exc)[:70]))
             continue
-        if not args.no_time_solve:
-            r["t_snr5_hr"] = time_for_snr(
-                r, args.target_snr, args.max_dit) / 3600.0
-            if np.isfinite(r.get("int_snr_cc", float("nan"))):
-                r["t_snr5_cc_hr"] = time_for_snr(
-                    r, args.target_snr, args.max_dit,
-                    with_continuum=True) / 3600.0
         recs.append(r)
 
     if not recs:
@@ -717,8 +677,7 @@ def main(argv=None):
         print(f"    continuum / line in band  : {r['cont_over_line']:.3f}")
 
     print(f"\n  {'name':<16s} {'t[s]':>6s} {'int_snr':>8s} {'int_snr_cc':>11s} "
-          f"{'penalty':>8s} {'boxcar':>7s} {'limiting noise':<18s} "
-          f"{'t5[h]':>7s} {'t5_cc[h]':>9s}")
+          f"{'penalty':>8s} {'boxcar':>7s} {'limiting noise':<18s}")
     for _, r in res.sort_values("int_snr", ascending=False).iterrows():
         def f(v, w, d=2):
             return f"{v:{w}.{d}f}" if v is not None and np.isfinite(v) \
@@ -726,8 +685,7 @@ def main(argv=None):
         print(f"  {str(r['name'])[:16]:<16s} {r['exptime_s']:6.0f} "
               f"{f(r['int_snr'], 8)} {f(r.get('int_snr_cc'), 11)} "
               f"{f(r.get('snr_penalty'), 8)} {f(r['int_snr_boxcar'], 7)} "
-              f"{r['limiting_noise']:<18s} "
-              f"{f(r.get('t_snr5_hr'), 7, 3)} {f(r.get('t_snr5_cc_hr'), 9, 3)}")
+              f"{r['limiting_noise']:<18s}")
 
     # ---- probe-times handling -------------------------------------------
     n_times = res["exptime_s"].nunique()
@@ -748,8 +706,8 @@ def main(argv=None):
                   f"{worst['measured']:.2f})")
             print(f"      median                : {chk['rel_err'].abs().median():.3%}")
             if chk["rel_err"].abs().max() > 0.05:
-                print(f"      WARNING: above 5%, so t_snr5 from a single run "
-                      f"should not be trusted")
+                print(f"      WARNING: above 5%, so the linear rate model "
+                      f"does not hold well for this target")
 
     if res["saturated"].any() or res["nonlinear"].any():
         print(f"\n  WARNING: {int(res['saturated'].sum())} saturated, "
@@ -770,7 +728,6 @@ def main(argv=None):
                 "exptime_s", "npix",
                 "folder", "flux_fraction", "limiting_noise", "frac_var_line",
                 "frac_var_sky", "frac_var_cont", "frac_var_const", "saturated"]
-        cols += [c for c in ("t_snr5_hr", "t_snr5_cc_hr") if c in res_out.columns]
         cols = [c for c in cols if c in res_out.columns]
         add = res_out[cols].rename(columns={
             "exptime_s": "etc_exptime_s", "npix": "etc_npix",
