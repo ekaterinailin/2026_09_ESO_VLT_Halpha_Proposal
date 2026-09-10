@@ -11,9 +11,12 @@ in a year; this script treats that as 18 exposures of the given DIT
 and asks whether the annual usable-night count supports them).
 
 The script uses the `visibility_astroplan.py` logic by calling it as a
-library to compute per-target `nights_with_baseline` (usable nights)
-for the given `exptime` and overhead. It then checks if nights_with_baseline
->= required_visits and reports pass/fail.
+library to compute per-target `usable_nights`, using each row's own
+`etc_exptime_s` (written by collect_etc_snr) plus the given overhead --
+there is no separate exposure time to pass on the command line, and a row
+with no `etc_exptime_s` (no ETC result for that target) is left without a
+usable_nights verdict rather than guessed at. It then checks if
+usable_nights >= required_visits and reports pass/fail.
 
 Output: CSV with columns from input plus `required_visits`, `usable_nights`,
 `can_schedule` (bool) and `notes`.
@@ -22,9 +25,9 @@ Output: CSV with columns from input plus `required_visits`, `usable_nights`,
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 
+import numpy as np
 import pandas as pd
 
 from visibility_astroplan import annual_observability, build_constraints, SITES, DEFAULT_SITE
@@ -35,7 +38,7 @@ from astropy.time import Time
 
 
 def compute_for_catalogue(catfile: str, outcsv: str, site: str,
-                          exptime: float, overhead: float,
+                          overhead: float,
                           visits: int, exposures_per_visit: int,
                           year: int, step_min: float,
                           moon_sep: float | None, moon_illum: float | None,
@@ -65,48 +68,77 @@ def compute_for_catalogue(catfile: str, outcsv: str, site: str,
         raise SystemExit(
             f"'{catfile}' has no ra_deg/dec_deg columns; run collect_etc_snr "
             f"first so coordinates are resolved before visibility is computed")
-    names = list(cat['name']) if 'name' in cat.columns else list(cat.get('designation', []))
-    coords = [SkyCoord(r * u.deg, d * u.deg) for r, d in zip(cat['ra_deg'], cat['dec_deg'])]
-    targets = [FixedTarget(coord=c, name=n) for c, n in zip(coords, names)]
+    if 'name' not in cat.columns:
+        raise SystemExit(f"'{catfile}' has no 'name' column")
 
-    # compute annual observability (this returns arrays aligned with targets)
-    # Pass exptime and additive fixed_overhead_s (seconds) to annual_observability
-    effective_exptime = float(exptime) + float(fixed_overhead_s)
-    r = annual_observability(targets, observer, constraints, float(exptime), float(fixed_overhead_s), year, step_min, s['lon'])
+    # collect_etc_snr now writes one row per (target, exposure time) probed,
+    # so a target can appear several times with a different etc_exptime_s
+    # each. The expensive part -- which nights a target clears the airmass/
+    # twilight/Moon constraints at all -- depends only on its RA/Dec, not on
+    # exposure time, so that (`baseline`, per target per night) is computed
+    # once per unique target. Exposure time only sets the per-night
+    # contiguous-block threshold applied on top of that, which is cheap, so
+    # it is reapplied per row with that row's own exposure time.
+    uniq = cat.drop_duplicates(subset='name')[['name', 'ra_deg', 'dec_deg']]
+    coords = [SkyCoord(r * u.deg, d * u.deg)
+             for r, d in zip(uniq['ra_deg'], uniq['dec_deg'])]
+    targets = [FixedTarget(coord=c, name=n)
+              for c, n in zip(coords, uniq['name'])]
+    # The exptime_s argument here only affects fields of `r` this function
+    # doesn't use (nights_usable and friends, computed from a single global
+    # threshold); `baseline` -- the only field read below -- depends on
+    # RA/Dec alone, so a placeholder is passed and each row's own exposure
+    # time is applied afterward instead.
+    r = annual_observability(targets, observer, constraints, 0.0,
+                             float(fixed_overhead_s), year, step_min, s['lon'])
+    baseline_by_name = dict(zip(uniq['name'], r['baseline']))
 
-    # load the by-time table and merge/add columns keyed on `name`
-    bytimefile = outcsv
-    if not os.path.exists(bytimefile):
-        raise SystemExit(f"by-time file '{bytimefile}' not found")
-    by = pd.read_csv(bytimefile)
+    # Exposure time is only known per row, from collect_etc_snr's own
+    # etc_exptime_s (there is no global fallback: a row with no ETC result
+    # has no exposure time to check visibility for).
+    if 'etc_exptime_s' not in cat.columns:
+        raise SystemExit(
+            f"'{catfile}' has no etc_exptime_s column; run collect_etc_snr "
+            f"first so each row carries the exposure time it was measured at")
+    row_exptime = cat['etc_exptime_s'].astype(float)
+    have_exptime = row_exptime.notna()
+    if not have_exptime.any():
+        raise SystemExit(f"'{catfile}' has no rows with an exposure time "
+                         f"(etc_exptime_s is empty)")
 
-    # Build a small summary DataFrame from `cat` aligned with `r`
-    summary = pd.DataFrame({
-        'name': names,
-        'required_visits': required_visits,
-        'exposures_per_visit': exposures_per_visit,
-        'total_exposures_required': total_exposures,
-        'usable_nights': r['nights_usable'],
-        'can_schedule': r['nights_usable'] >= required_visits,
-        'notes': ['' if x else 'insufficient usable nights' for x in (r['nights_usable'] >= required_visits)],
-        'fixed_overhead_s': float(fixed_overhead_s),
-        'effective_exptime_s': float(effective_exptime),
-    })
+    need_h = (row_exptime + fixed_overhead_s) / 3600.0
+    usable_nights = pd.Series(np.nan, index=cat.index)
+    usable_nights.loc[have_exptime] = [
+        int((baseline_by_name[n] >= h).sum())
+        for n, h in zip(cat.loc[have_exptime, 'name'], need_h[have_exptime])
+    ]
+    can_schedule = pd.Series(pd.NA, index=cat.index, dtype='boolean')
+    can_schedule.loc[have_exptime] = usable_nights[have_exptime] >= required_visits
 
-    # merge: there may be multiple by-time rows per target; use left join on name
-    merged = by.merge(summary, on='name', how='left')
+    notes = pd.Series('', index=cat.index)
+    notes.loc[~have_exptime] = 'no exposure time (no ETC result for this target)'
+    notes.loc[have_exptime & (usable_nights < required_visits)] = \
+        'insufficient usable nights'
 
-    # overwrite the by-time file
-    merged.to_csv(bytimefile, index=False)
+    cat['required_visits'] = required_visits
+    cat['exposures_per_visit'] = exposures_per_visit
+    cat['total_exposures_required'] = total_exposures
+    cat['usable_nights'] = usable_nights
+    cat['can_schedule'] = can_schedule
+    cat['notes'] = notes
+    cat['fixed_overhead_s'] = float(fixed_overhead_s)
+    cat['effective_exptime_s'] = need_h * 3600.0
+
+    cat.to_csv(outcsv, index=False)
 
 
 def cli(argv=None):
     p = argparse.ArgumentParser()
     p.add_argument('input', help='collector output CSV (out.csv)')
-    p.add_argument('--out', default='out_bytime.csv',
-                   help='by-time CSV to update (default: out_bytime.csv)')
+    p.add_argument('--out', default=None,
+                   help='where to write `input` plus the visibility columns '
+                        '(default: update `input` in place)')
     p.add_argument('--site', default=DEFAULT_SITE)
-    p.add_argument('--exptime', type=float, default=3600.0, help='DIT seconds')
     p.add_argument('--overhead', type=float, default=1.2)
     p.add_argument('--tel-overhead', type=float, default=600.0,
                    help='standard telescope overhead in seconds')
@@ -130,7 +162,7 @@ def cli(argv=None):
     fixed_overhead_s = (args.tel_overhead + args.instr_overhead +
                         args.acq_overhead + args.readout_per_spec * args.n_spec)
 
-    compute_for_catalogue(args.input, args.out, args.site, args.exptime,
+    compute_for_catalogue(args.input, args.out or args.input, args.site,
                           args.overhead, args.visits, args.per_visit,
                           args.year, args.step, args.moon_sep, args.moon_illum,
                           args.twilight, fixed_overhead_s=fixed_overhead_s)

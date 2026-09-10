@@ -100,9 +100,6 @@ C_LIGHT = 2.99792458e8
 
 
 # ---------------------------------------------------------------------------
-TIME_DIR_RE = None       # compiled lazily, see folder_exptime()
-
-
 def classify(path: str):
     """Say whether a JSON file is an ETC output, an ETC input, or neither.
 
@@ -111,6 +108,14 @@ def classify(path: str):
     not.  Without this split, pointing the collector at a job folder produces
     one confusing KeyError per input file, which is easy to mistake for the
     outputs having failed.
+
+    Parameters:
+      path -- path to a JSON file.
+
+    Returns:
+      (kind, doc, reason). kind is "output" | "input" | "other" | "unreadable";
+      doc is the parsed dict (None if unreadable); reason is a short string,
+      empty unless kind is "other" or "unreadable".
     """
     try:
         with open(path) as fh:
@@ -128,12 +133,26 @@ def classify(path: str):
 
 
 def safe_name(text: str) -> str:
-    """The filename form make_etc_jobs uses for a target name."""
+    """The filename form make_etc_jobs uses for a target name.
+
+    Parameters:
+      text -- a target name.
+
+    Returns:
+      the name with every run of non-alphanumerics collapsed to a single "_".
+    """
     return re.sub(r"[^A-Za-z0-9]+", "_", str(text)).strip("_")
 
 
 def parse_2mass_radec(designation: str) -> tuple[float, float]:
-    """RA, Dec in degrees from a 2MASS designation, or NaN on a bad string."""
+    """RA, Dec in degrees from a 2MASS designation, or NaN on a bad string.
+
+    Parameters:
+      designation -- a 2MASS designation, e.g. "2MASS J03140344+1603056".
+
+    Returns:
+      (ra_deg, dec_deg), or (nan, nan) if the string does not parse.
+    """
     s = re.sub(r"\s+", "", str(designation)).upper()
     s = re.sub(r"^2MASS", "", s)
     s = re.sub(r"^J", "", s)
@@ -161,7 +180,14 @@ def build_name_resolver(files, manifests, catalogue_names):
       3. the output filename stem, matched against the catalogue names after
          normalising punctuation the same way make_etc_jobs does.
 
-    Returns a dict keyed by absolute output path.
+    Parameters:
+      files           -- ETC output paths to resolve.
+      manifests       -- json_to_target_dict.csv paths to match job paths against.
+      catalogue_names -- target names to match filename stems against.
+
+    Returns:
+      dict mapping absolute output path -> (target_name, source), where source
+      is "manifest" or "filename". Paths that could not be resolved are absent.
     """
     resolved = {}
 
@@ -202,26 +228,17 @@ def build_name_resolver(files, manifests, catalogue_names):
     return resolved
 
 
-def folder_exptime(path: str):
-    """Exposure time encoded in a path component like 't3600s', or None.
-
-    make_etc_jobs writes one subdirectory per probe time, and the ETC results
-    end up beside the inputs in those same tXXXXs folders.  Reading the time
-    from the folder gives an independent handle on it, which is used only to
-    cross-check the value inside the file, never to override it.
-    """
-    global TIME_DIR_RE
-    if TIME_DIR_RE is None:
-        TIME_DIR_RE = re.compile(r"^t(\d+(?:\.\d+)?)s$")
-    for part in os.path.normpath(os.path.abspath(path)).split(os.sep):
-        m = TIME_DIR_RE.match(part)
-        if m:
-            return float(m.group(1))
-    return None
-
-
 def _order_arrays(spec: dict):
-    """Wavelength in nm plus the target, sky and noise arrays for one order."""
+    """Wavelength in nm plus the target, sky and noise arrays for one order.
+
+    Parameters:
+      spec -- one entry of data.plots.spectra.
+
+    Returns:
+      (w_nm, target_e, sky_e, noise_e, const_var, noise_info). The first four
+      are per-pixel arrays; const_var is the scalar dark + read-noise variance
+      per pixel; noise_info is the ETC's noise metadata dict (ron, nspat, ...).
+    """
     nc = spec["noise_components"]
     w = np.asarray(spec["wavelength"], dtype=float) * 1e9        # m -> nm
     t = np.asarray(nc["target"], dtype=float)
@@ -237,6 +254,15 @@ def average_snr_per_pixel_in_band(path: str, lo_nm: float, hi_nm: float) -> dict
 
     This is the direct analogue of the FeH-band measurement in Reiners & Basri,
     where the reported quantity is the average S/N per pixel over a chosen band.
+
+    Parameters:
+      path         -- an ETC output JSON.
+      lo_nm, hi_nm -- wavelength window in nm.
+
+    Returns:
+      dict with mean / RMS / 16th / 84th-percentile per-pixel S/N, pixel count,
+      mean signal and noise, and a per_order breakdown.
+      Raises ValueError if no pixels fall in the window.
     """
     with open(path) as fh:
         doc = json.load(fh)
@@ -298,7 +324,20 @@ def average_snr_per_pixel_in_band(path: str, lo_nm: float, hi_nm: float) -> dict
 
 def integrate_line(path: str, n_sigma: float = 4.0,
                    ew_angstrom: float | None = None) -> dict:
-    """Integrate the S/N over the emission line in one ETC output file."""
+    """Integrate the S/N over the emission line in one ETC output file.
+
+    Parameters:
+      path        -- an ETC output JSON.
+      n_sigma     -- integration half-width, in line sigmas.
+      ew_angstrom -- Halpha equivalent width in Angstrom; when > 0 it enables
+                     the continuum correction, otherwise int_snr_cc is NaN.
+
+    Returns:
+      dict of one run's results -- int_snr, int_snr_cc, int_snr_boxcar, the
+      noise budget, line diagnostics, and _orders (per-order rates, dropped
+      before the CSV is written).
+      Raises ValueError if no order carries flux or the window is too narrow.
+    """
     with open(path) as fh:
         doc = json.load(fh)
 
@@ -442,6 +481,14 @@ def predict_snr(rec: dict, t: float, n_exp: int = 1) -> float:
 
     Signal and sky scale with time; the read-noise and dark variance scale with
     the number of exposures.
+
+    Parameters:
+      rec   -- an integrate_line result (needs its _orders rate arrays).
+      t     -- exposure time in seconds.
+      n_exp -- number of exposures the read noise is spread over.
+
+    Returns:
+      the extrapolated integrated (matched-filter) S/N.
     """
     total = 0.0
     for o in rec["_orders"]:
@@ -459,6 +506,13 @@ def check_extrapolation(recs: list) -> pd.DataFrame:
     time. A --probe-times sweep gives an independent way to check that this
     linear-scaling assumption actually holds: each target's shortest run is
     used to predict the others, and predicted vs measured is compared.
+
+    Parameters:
+      recs -- integrate_line results, ideally several exposure times per target.
+
+    Returns:
+      DataFrame with one row per (target, exposure time): measured vs predicted
+      int_snr and their relative error. Empty if no target has more than one time.
     """
     rows = []
     by_name = {}
@@ -478,6 +532,15 @@ def check_extrapolation(recs: list) -> pd.DataFrame:
 
 
 def main(argv=None):
+    """Integrate every ETC output and write one row per run to --output.
+
+    Parameters:
+      argv -- command-line arguments (defaults to sys.argv).
+
+    Returns:
+      0 on success. Side effect: writes the CSV to --output, one row per ETC
+      run (target x exposure time), merged into --catalogue if one is given.
+    """
     p = argparse.ArgumentParser(
         description="Integrate ETC line S/N and merge into the catalogue.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -561,7 +624,7 @@ def main(argv=None):
         list(cat["name"]) if cat is not None and "name" in cat.columns else [])
     name_sources = {}
 
-    recs, failed, time_mismatch = [], [], []
+    recs, failed = [], []
     for f, doc in outputs:
         try:
             nm = doc.get("input", {}).get("sky", {}) \
@@ -580,11 +643,6 @@ def main(argv=None):
             r["name_source"] = src
             r["ew_is_limit"] = ew_lim
             r["folder"] = os.path.basename(os.path.dirname(os.path.abspath(f)))
-            ft = folder_exptime(f)
-            r["folder_exptime_s"] = ft if ft is not None else float("nan")
-            if ft is not None and abs(ft - r["exptime_s"]) > 1e-6:
-                time_mismatch.append((nm or os.path.basename(f), ft,
-                                      r["exptime_s"]))
         except (KeyError, ValueError) as exc:
             failed.append((os.path.basename(f), str(exc)[:70]))
             continue
@@ -638,13 +696,6 @@ def main(argv=None):
             ts = sorted({r["exptime_s"] for r in sub})
             print(f"    {fo:<12s} {len(sub):>3d} target(s), DIT "
                   + ", ".join(f"{t:.0f}s" for t in ts))
-    if time_mismatch:
-        print(f"\n  WARNING: folder name disagrees with the exposure time "
-              f"inside the file for {len(time_mismatch)} result(s):")
-        for nm, ft, ft_in in time_mismatch[:6]:
-            print(f"    {nm:<18s} folder says {ft:.0f}s, file says {ft_in:.0f}s")
-        print(f"    the value from the file is used; a mismatch usually means "
-              f"a stale result was left in place")
 
     r0 = recs[0]
     print(f"\n  consistency checks on {r0['name'] or r0['file']}:")
@@ -713,10 +764,8 @@ def main(argv=None):
         print(f"\n  WARNING: {int(res['saturated'].sum())} saturated, "
               f"{int(res['nonlinear'].sum())} non-linear")
 
-    # ---- write: one row per ETC run (target x exposure time), always -----
-    # No reference run is picked and nothing is collapsed, so every probed
-    # exposure time reaches the output as its own row; a target probed once
-    # (the common case) just produces one row, same as before.
+    # ---- write: one row per ETC run (target x exposure time) -----
+
     res_out = res.drop(columns=[c for c in res.columns if c.startswith("_")])
     if args.catalogue:
         key = "name" if "name" in cat.columns else None
