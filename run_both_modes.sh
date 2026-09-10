@@ -14,8 +14,6 @@ set -eu
 # 4) Compute annual visibility/scheduling feasibility and merge the
 #    results in-place into that mode CSV (05_calc_visibility_for_exposures.py
 #    updates the same out.csv / out2x2.csv file).
-# 5) Report the ETC S/N implied by the Reiners & Basri upper limits
-#    (06_upper_limit_snr.py -> upper_limit_snr.csv / upper_limit_snr_2x2.csv).
 #
 # Python scripts (execution order):
 # - 01_halpha_flux.py            # compute Halpha flux columns for the catalogue
@@ -26,7 +24,6 @@ set -eu
 # - 03_etc_cli.py (ETC_CLI)      # run the ETC on each JSON, producing .out.json
 # - 04_collect_etc_snr.py        # collect per-target SNR and merge into out*.csv
 # - 05_calc_visibility_for_exposures.py  # compute visibility & merge into out*.csv
-# - 06_upper_limit_snr.py        # S/N implied by the RB upper limits -> upper_limit_snr*.csv
 #
 # Environment knobs: ETC_CLI, SERVER, PYTHON, CATALOGUE, EXPTIME,
 # MAKE_JOBS, FORCE_MAKE, SKIP_EXISTING_OUT and visibility-specific vars
@@ -171,10 +168,8 @@ for dir in "${MODE_DIRS[@]}"; do
         base=$(basename "$dir")
         if [ "$base" = "etc_jobs_2x2" ] || printf '%s' "$base" | grep -q "2x2"; then
             outcsv="out2x2.csv"
-            ulcsv="upper_limit_snr_2x2.csv"
         else
             outcsv="out.csv"
-            ulcsv="upper_limit_snr.csv"
         fi
         echo "Collecting SNR results for $dir -> $outcsv"
         "$PYTHON" 04_collect_etc_snr.py "$dir" --catalogue "$FLUXED_CATALOGUE" --output "$outcsv"
@@ -197,14 +192,6 @@ for dir in "${MODE_DIRS[@]}"; do
             echo
         else
             echo "05_calc_visibility_for_exposures.py not found; skipping visibility update" >&2
-        fi
-        # S/N implied by the Reiners & Basri upper limits (non-detections).
-        if [ -f 06_upper_limit_snr.py ]; then
-            echo "Computing RB upper-limit S/N for $outcsv -> $ulcsv"
-            "$PYTHON" 06_upper_limit_snr.py "$outcsv" --output "$ulcsv"
-            echo
-        else
-            echo "06_upper_limit_snr.py not found; skipping upper-limit S/N" >&2
         fi
 done
 
